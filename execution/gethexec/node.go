@@ -36,6 +36,7 @@ import (
 	"github.com/offchainlabs/nitro/execution"
 	"github.com/offchainlabs/nitro/execution/gethexec/addressfilter"
 	"github.com/offchainlabs/nitro/execution/gethexec/eventfilter"
+	"github.com/offchainlabs/nitro/execution/gethexec/receiptexporter"
 	executionrpcserver "github.com/offchainlabs/nitro/execution/rpcserver"
 	"github.com/offchainlabs/nitro/gethhook"
 	"github.com/offchainlabs/nitro/solgen/go/precompilesgen"
@@ -215,6 +216,7 @@ type Config struct {
 	ConsensusRPCClient          rpcclient.ClientConfig     `koanf:"consensus-rpc-client" reload:"hot"`
 	DisableArbOwnerEthCall      bool                       `koanf:"disable-arbowner-ethcall"`
 	LegacyZeroBaseFeeUntil      uint64                     `koanf:"legacy-zero-base-fee-until"`
+	ReceiptExport               receiptexporter.Config     `koanf:"receipt-export"`
 
 	forwardingTarget string
 }
@@ -275,6 +277,7 @@ func ConfigAddOptions(prefix string, f *pflag.FlagSet) {
 	LiveTracingConfigAddOptions(prefix+".vmtrace", f)
 	rpcserver.ConfigAddOptions(prefix+".rpc-server", "execution", f)
 	rpcclient.RPCClientAddOptions(prefix+".consensus-rpc-client", f, &ConfigDefault.ConsensusRPCClient)
+	receiptexporter.ConfigAddOptions(prefix+".receipt-export", f)
 }
 
 type LiveTracingConfig struct {
@@ -314,6 +317,7 @@ var ConfigDefault = Config{
 	ExposeMultiGas:              false,
 	DisableArbOwnerEthCall:      false,
 	LegacyZeroBaseFeeUntil:      0,
+	ReceiptExport:               receiptexporter.DefaultConfig,
 
 	RPCServer: rpcserver.DefaultConfig,
 	ConsensusRPCClient: rpcclient.ClientConfig{
@@ -351,6 +355,7 @@ type ExecutionNode struct {
 	consensusRPCClient       *consensusrpcclient.ConsensusRPCClient
 	filteringReportRPCClient *FilteringReportRPCClient
 	AddressFilterService     *addressfilter.FilterService
+	ReceiptExporter          *receiptexporter.Exporter
 	EventFilter              *eventfilter.EventFilter
 }
 
@@ -397,6 +402,14 @@ func CreateExecutionNode(
 	}
 	if config.Caching.DisableStylusCacheMetricsCollection {
 		execEngine.DisableStylusCacheMetricsCollection()
+	}
+	var receiptExporter *receiptexporter.Exporter
+	if config.ReceiptExport.Enabled() {
+		receiptExporter, err = receiptexporter.New(&config.ReceiptExport)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create receipt exporter: %w", err)
+		}
+		execEngine.SetReceiptExporter(receiptExporter)
 	}
 
 	recorder := NewBlockRecorder(&config.RecordingDatabase, execEngine, executionDB)
@@ -506,6 +519,7 @@ func CreateExecutionNode(
 		filteringReportRPCClient: filteringReportRPCClient,
 		AddressFilterService:     addressFilterService,
 		EventFilter:              eventFilter,
+		ReceiptExporter:          receiptExporter,
 	}
 
 	if config.ConsensusRPCClient.URL != "" {
@@ -640,6 +654,12 @@ func (n *ExecutionNode) Start(ctxIn context.Context) error {
 		n.AddressFilterService.Start(ctx)
 	}
 
+	if n.ReceiptExporter != nil {
+		if err := n.ReceiptExporter.Start(ctx); err != nil {
+			return fmt.Errorf("error starting receipt exporter: %w", err)
+		}
+	}
+
 	err = n.ExecEngine.Start(ctx)
 	if err != nil {
 		return fmt.Errorf("error starting execution engine: %w", err)
@@ -682,6 +702,9 @@ func (n *ExecutionNode) StopAndWait() {
 	}
 	if n.ExecEngine.Started() {
 		n.ExecEngine.StopAndWait()
+	}
+	if n.ReceiptExporter != nil {
+		n.ReceiptExporter.StopAndWait()
 	}
 	if n.consensusRPCClient != nil {
 		n.consensusRPCClient.StopAndWait()
