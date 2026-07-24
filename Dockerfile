@@ -204,7 +204,7 @@ RUN ./download-machine.sh consensus-v51.1 0xc2c02df561d4afaf9a1d6785f70098ec3874
 RUN ./download-machine.sh consensus-v61 0xc10cd7ec6acaf1c441a3f6bd0900ad20f15855ba775a96f1939118cbc629dc97
 
 # Factored out of node-builder so the stripped variant doesn't depend on it.
-FROM golang:1.25-bookworm AS node-builder-base
+FROM golang:1.25.11-bookworm AS node-builder-base
 WORKDIR /workspace
 ARG version=""
 ARG datetime=""

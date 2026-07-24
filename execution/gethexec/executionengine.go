@@ -52,6 +52,7 @@ import (
 	"github.com/offchainlabs/nitro/execution"
 	"github.com/offchainlabs/nitro/execution/gethexec/addressfilter"
 	"github.com/offchainlabs/nitro/execution/gethexec/eventfilter"
+	"github.com/offchainlabs/nitro/execution/gethexec/receiptexporter"
 	"github.com/offchainlabs/nitro/util/arbmath"
 	"github.com/offchainlabs/nitro/util/containers"
 	"github.com/offchainlabs/nitro/util/sharedmetrics"
@@ -298,6 +299,8 @@ type ExecutionEngine struct {
 	transactionFiltererRPCClient   *TransactionFiltererRPCClient
 	filteringReportRPCClient       *FilteringReportRPCClient
 	disableDelayedSequencingFilter bool
+
+	receiptExporter *receiptexporter.Exporter
 }
 
 func NewL1PriceData() *L1PriceData {
@@ -418,6 +421,16 @@ func (s *ExecutionEngine) Initialize(rustCacheCapacityMB uint32, targetConfig *S
 	// Establishes the baseline for doubleNativeStackSize (overflow recovery).
 	programs.SetInitialNativeStackSize(targetConfig.NativeStackSize)
 	return nil
+}
+
+// SetReceiptExporter attaches a shared-memory receipt exporter that receives
+// the receipts of every block committed by this engine. Must be called before
+// Start.
+func (s *ExecutionEngine) SetReceiptExporter(exporter *receiptexporter.Exporter) {
+	if s.Started() {
+		panic("trying to set receipt exporter after start")
+	}
+	s.receiptExporter = exporter
 }
 
 func (s *ExecutionEngine) SetRecorder(recorder *BlockRecorder) {
@@ -1079,6 +1092,11 @@ func (s *ExecutionEngine) appendBlock(block *types.Block, statedb *state.StateDB
 		}
 	}
 	blockWriteToDbTimer.Update(time.Since(startTime).Nanoseconds())
+	// Export the freshly committed block's receipts to any co-located consumer.
+	// Non-blocking: never stalls the block-commit path.
+	if s.receiptExporter != nil {
+		s.receiptExporter.PublishBlockReceipts(block, receipts)
+	}
 	baseFeeGauge.Update(block.BaseFee().Int64())
 	txCountHistogram.Update(int64(len(block.Transactions()) - 1))
 	var blockGasused uint64
