@@ -40,3 +40,8 @@ tmp/*
 .env
 go.work
 go.work.sum
+
+# local build logs and python caches (receipt exporter tooling)
+build*.log
+**/__pycache__/
+*.pyc
