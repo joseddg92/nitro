@@ -1071,6 +1071,15 @@ func (s *ExecutionEngine) createBlockFromNextMessage(msg *arbostypes.MessageWith
 
 // must hold createBlockMutex
 func (s *ExecutionEngine) appendBlock(block *types.Block, statedb *state.StateDB, receipts types.Receipts, duration time.Duration) error {
+	// Export the block's receipts to any co-located consumer BEFORE the durable
+	// DB write, to minimise notification latency. This runs inline on the
+	// (createBlocksMutex-serialised) commit path and is non-blocking. Note the
+	// block is not yet durably committed here: if the write below fails (rare)
+	// the consumer may have observed a block that is subsequently retried.
+	if s.receiptExporter != nil {
+		s.receiptExporter.PublishBlockReceipts(block, receipts)
+	}
+
 	var logs []*types.Log
 	for _, receipt := range receipts {
 		logs = append(logs, receipt.Logs...)
@@ -1092,11 +1101,6 @@ func (s *ExecutionEngine) appendBlock(block *types.Block, statedb *state.StateDB
 		}
 	}
 	blockWriteToDbTimer.Update(time.Since(startTime).Nanoseconds())
-	// Export the freshly committed block's receipts to any co-located consumer.
-	// Non-blocking: never stalls the block-commit path.
-	if s.receiptExporter != nil {
-		s.receiptExporter.PublishBlockReceipts(block, receipts)
-	}
 	baseFeeGauge.Update(block.BaseFee().Int64())
 	txCountHistogram.Update(int64(len(block.Transactions()) - 1))
 	var blockGasused uint64
