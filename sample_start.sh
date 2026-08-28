@@ -117,6 +117,19 @@ exec /home/robinhood/nitro \
   \
   --persistent.handles=2048 \
   \
+  `# ---------- tx indexer: stop it spinning on the tail key ----------` \
+  `# Profiled (120s, warm node): rawdb.ReadTxIndexTail was 23.9% of ALL node CPU` \
+  `# and 85% of every Pebble read, while the profile contained ZERO` \
+  `# IndexTransactions/UnindexTransactions samples -- i.e. the indexer was doing` \
+  `# no indexing at all. This chain is fully indexed (tail == 0), so txIndexer.run` \
+  `# reads the tail key, finds nothing to do, returns; txIndexer.loop then reads` \
+  `# the same key again (core/txindexer.go:300). That cycle repeats every` \
+  `# min-batch-delay forever, and each read fans out across a 339GB LSM paying a` \
+  `# CRC32 verify per sstable block it touches (~45ms of CPU per read).` \
+  `# 60s cuts the frequency ~60x. The indexer stays functional -- it just stops` \
+  `# asking 'is there anything to do?' once a second.` \
+  --execution.tx-indexer.min-batch-delay=60s \
+  \
   `# ---------- lowest-latency block pipeline (arb/block/sendipc) ----------` \
   `# Speculatively execute msg+1 in the background while msg is mid-commit, so` \
   `# by the time msg+1 reaches DigestMessage its state reads are already warm.` \
