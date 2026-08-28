@@ -1078,7 +1078,6 @@ func (s *ExecutionEngine) createBlockFromNextMessage(msg *arbostypes.MessageWith
 			s.bc,
 			runCtx,
 			s.exposeMultiGas,
-			s.addressChecker,
 			s.receiptExporter,
 		)
 	}

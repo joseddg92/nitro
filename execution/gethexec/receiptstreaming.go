@@ -102,7 +102,6 @@ func produceBlockStreaming(
 	chainContext core.ChainContext,
 	runCtx *core.MessageRunContext,
 	exposeMultiGas bool,
-	addressChecker state.AddressChecker,
 	exporter *receiptexporter.Exporter,
 ) (*types.Block, *state.StateDB, types.Receipts, error) {
 	chainConfig := chainContext.Config()
@@ -125,7 +124,11 @@ func produceBlockStreaming(
 		false, // never the prefetch run: prefetch results are discarded, so publishing them would be wrong
 		runCtx,
 		exposeMultiGas,
-		addressChecker,
+		// nil, matching arbos.ProduceBlock. Address checking is opt-in and only
+		// wired up on the delayed-message filtering path, which calls
+		// ProduceBlockAdvanced directly with the engine's checker; the ordinary
+		// digest path must not enable it.
+		nil,
 	)
 }
 
