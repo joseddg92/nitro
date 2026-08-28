@@ -112,6 +112,11 @@ func produceBlockStreaming(
 		txes = types.Transactions{}
 	}
 
+	// Recover the senders on spare cores while the loop below gets going. Must
+	// happen here, on these exact transaction objects, because that is where
+	// types.Sender caches its result. See sender_prewarm.go.
+	prewarmSenders(chainConfig, lastBlockHeader, lastArbosVersion, txes)
+
 	hooks := newStreamingSequencingHooks(txes, exporter, lastBlockHeader.Number.Uint64()+1)
 
 	return arbos.ProduceBlockAdvanced(
