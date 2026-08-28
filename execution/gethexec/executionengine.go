@@ -411,6 +411,11 @@ func (s *ExecutionEngine) Initialize(rustCacheCapacityMB uint32, targetConfig *S
 	if rustCacheCapacityMB != 0 {
 		programs.SetWasmLruCacheCapacity(arbmath.SaturatingUMul(uint64(rustCacheCapacityMB), 1024*1024))
 	}
+	// Share JUMPDEST analysis across the per-tx EVMs that ProduceBlockAdvanced
+	// builds, instead of re-analysing every contract on every tx. Installed here
+	// rather than in arbos so the replay/WAVM binary, which never runs this,
+	// keeps geth's stock per-EVM cache. See arbos/jumpdest_cache.go.
+	arbos.InstallSharedJumpDestCache(arbos.DefaultJumpDestCacheEntries)
 	if err := PopulateStylusTargetCache(targetConfig); err != nil {
 		return fmt.Errorf("error populating stylus target cache: %w", err)
 	}

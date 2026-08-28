@@ -519,6 +519,14 @@ func ProduceBlockAdvanced(
 			gasPool := gethGas
 			blockContext := core.NewEVMBlockContext(header, chainContext, &header.Coinbase)
 			evm := vm.NewEVM(blockContext, buildState.statedb, chainConfig, vm.Config{ExposeMultiGas: exposeMultiGas})
+			// A new EVM per tx means a new empty JUMPDEST cache per tx, so every
+			// contract a tx touches is re-analysed from scratch. Reuse the
+			// process-wide cache when one is installed; see jumpdest_cache.go.
+			// nil (the default, and always the case under replay) leaves geth's
+			// stock per-EVM map untouched.
+			if jdc := jumpDestCache(); jdc != nil {
+				evm.SetJumpDestCache(jdc)
+			}
 			receipt, result, err := core.ApplyTransactionWithResultFilter(
 				evm,
 				&gasPool,
