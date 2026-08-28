@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"math/big"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
@@ -18,6 +19,7 @@ import (
 // it is meaningfully cheaper to produce than the equivalent JSON.
 func encodeBlock(dst []byte, block *types.Block, receipts types.Receipts) []byte {
 	le := binary.LittleEndian
+	dst = append(dst, RecordBlock)
 	dst = le.AppendUint64(dst, block.NumberU64())
 	dst = append(dst, block.Hash().Bytes()...)
 	dst = append(dst, block.ParentHash().Bytes()...)
@@ -53,16 +55,44 @@ func encodeBlock(dst []byte, block *types.Block, receipts types.Receipts) []byte
 		}
 		dst = append(dst, word[:]...)
 
-		dst = le.AppendUint32(dst, uint32(len(r.Logs)))
-		for _, lg := range r.Logs {
-			dst = append(dst, lg.Address.Bytes()...)
-			dst = append(dst, byte(len(lg.Topics)))
-			for _, t := range lg.Topics {
-				dst = append(dst, t.Bytes()...)
-			}
-			dst = le.AppendUint32(dst, uint32(len(lg.Data)))
-			dst = append(dst, lg.Data...)
+		dst = appendLogs(dst, r.Logs)
+	}
+	return dst
+}
+
+// encodeTxLogs appends a RecordTx - one transaction's logs, published from
+// inside the block loop as soon as that tx finishes executing, long before the
+// block is finalised. Carries only what a log consumer needs: no block hash
+// (not computed yet) and no gas figures.
+//
+// txIndex is the receipt's position in the block and firstLogIndex is the
+// block-wide index of this tx's first log, so the consumer can reproduce the
+// chain's transactionIndex/logIndex numbering and dedup against the same log
+// seen elsewhere. See protocol.go for the layout and the speculative-delivery
+// caveat.
+func encodeTxLogs(dst []byte, blockNumber uint64, txIndex, firstLogIndex uint32, txHash common.Hash, status uint64, logs []*types.Log) []byte {
+	le := binary.LittleEndian
+	dst = append(dst, RecordTx)
+	dst = le.AppendUint64(dst, blockNumber)
+	dst = le.AppendUint32(dst, txIndex)
+	dst = le.AppendUint32(dst, firstLogIndex)
+	dst = append(dst, txHash.Bytes()...)
+	dst = append(dst, byte(status))
+	return appendLogs(dst, logs)
+}
+
+// appendLogs writes the shared [log_count][logs...] tail used by both records.
+func appendLogs(dst []byte, logs []*types.Log) []byte {
+	le := binary.LittleEndian
+	dst = le.AppendUint32(dst, uint32(len(logs)))
+	for _, lg := range logs {
+		dst = append(dst, lg.Address.Bytes()...)
+		dst = append(dst, byte(len(lg.Topics)))
+		for _, t := range lg.Topics {
+			dst = append(dst, t.Bytes()...)
 		}
+		dst = le.AppendUint32(dst, uint32(len(lg.Data)))
+		dst = append(dst, lg.Data...)
 	}
 	return dst
 }

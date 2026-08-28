@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/pflag"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 
@@ -141,11 +142,37 @@ func (e *Exporter) PublishBlockReceipts(block *types.Block, receipts types.Recei
 	defer e.pubMu.Unlock()
 
 	e.buf = encodeBlock(e.buf[:0], block, receipts)
+	e.pushLocked(block.NumberU64(), "block receipts")
+}
+
+// PublishTxLogs pushes a single transaction's logs (a RecordTx) as soon as that
+// tx has executed, from inside the block-building loop - well before the state
+// root, the block hash or the DB write. Same non-blocking contract as
+// PublishBlockReceipts: a full ring drops the record rather than stalling
+// execution.
+//
+// These records are SPECULATIVE: the block they belong to is not yet known to
+// be good. The RecordBlock published later is the reconciliation point. See
+// protocol.go.
+func (e *Exporter) PublishTxLogs(blockNumber uint64, txIndex, firstLogIndex uint32, txHash common.Hash, status uint64, logs []*types.Log) {
+	if e == nil || len(logs) == 0 {
+		return // nothing to notify about; don't spend a ring slot or an eventfd write
+	}
+	e.pubMu.Lock()
+	defer e.pubMu.Unlock()
+
+	e.buf = encodeTxLogs(e.buf[:0], blockNumber, txIndex, firstLogIndex, txHash, status, logs)
+	e.pushLocked(blockNumber, "tx logs")
+}
+
+// pushLocked pushes e.buf to the ring and signals the consumer. Caller must
+// hold pubMu and have already filled e.buf.
+func (e *Exporter) pushLocked(blockNumber uint64, what string) {
 	if !e.ring.push(e.buf) {
 		// Ring full or message larger than the ring; the consumer is behind.
 		if d := e.ring.droppedCount(); d == 1 || d%1000 == 0 {
-			log.Warn("receipt exporter ring full, dropping block receipts",
-				"totalDropped", d, "block", block.NumberU64(), "payloadLen", len(e.buf), "ringSize", e.capacity)
+			log.Warn("receipt exporter ring full, dropping "+what,
+				"totalDropped", d, "block", blockNumber, "payloadLen", len(e.buf), "ringSize", e.capacity)
 		}
 		return
 	}

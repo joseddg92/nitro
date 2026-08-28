@@ -1060,6 +1060,24 @@ func (s *ExecutionEngine) createBlockFromNextMessage(msg *arbostypes.MessageWith
 		return block, statedb, receipts, nil
 	}
 
+	// With a receipt exporter attached, stream each tx's logs as it executes
+	// instead of waiting for the whole block (see receiptstreaming.go). Never on
+	// the prefetch run: that block is speculative and thrown away, so publishing
+	// its logs would emit events for work that never happened.
+	if s.receiptExporter != nil && !isMsgForPrefetch {
+		return produceBlockStreaming(
+			msg.Message,
+			msg.DelayedMessagesRead,
+			currentHeader,
+			statedb,
+			s.bc,
+			runCtx,
+			s.exposeMultiGas,
+			s.addressChecker,
+			s.receiptExporter,
+		)
+	}
+
 	block, statedb, receipts, err := arbos.ProduceBlock(
 		msg.Message,
 		msg.DelayedMessagesRead,

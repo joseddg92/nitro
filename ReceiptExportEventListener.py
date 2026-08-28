@@ -12,7 +12,7 @@ How it differs from the other listeners:
 Wire format (must match execution/gethexec/receiptexporter/protocol.go), little-endian:
 
   Shared-memory header (4096-byte page), then the data ring:
-    off 0   u64 magic "NITRORB1" | off 8  u32 version(2) | off 12 u32 header_size(4096)
+    off 0   u64 magic "NITRORB1" | off 8  u32 version(3) | off 12 u32 header_size(4096)
     off 16  u64 capacity (power of two) | off 24 u64 dropped | off 32 u64 msg_count
     off 64  u64 head (consumer cursor — ours to advance) | off 128 u64 tail (producer cursor)
     off 4096    data[capacity]
@@ -21,20 +21,41 @@ Wire format (must match execution/gethexec/receiptexporter/protocol.go), little-
   record may wrap. The producer advances `tail` only after the whole record is written, so an
   observed tail means the record is complete.
 
-  Payload = one block:
-    Block:   block_number u64, block_hash[32], parent_hash[32], timestamp u64,
-             tx_count u32, receipt_count u32, receipts[]
-    Receipt: tx_hash[32], status u8, tx_type u8, contract_address[20], cumulative_gas_used u64,
-             gas_used u64, gas_used_for_l1 u64, effective_gas_price[32] (big-endian), log_count u32, logs[]
-    Log:     address[20], topic_count u8, topics[topic_count][32], data_len u32, data[data_len]
+  Every payload starts with a one-byte record type:
+
+    0x01 BLOCK — the whole block's receipts, published once the block is built. Authoritative.
+      Block:   block_number u64, block_hash[32], parent_hash[32], timestamp u64,
+               tx_count u32, receipt_count u32, receipts[]
+      Receipt: tx_hash[32], status u8, tx_type u8, contract_address[20], cumulative_gas_used u64,
+               gas_used u64, gas_used_for_l1 u64, effective_gas_price[32] (big-endian),
+               log_count u32, logs[]
+
+    0x02 TX — ONE transaction's logs, published from inside the block loop the instant that tx
+      finishes executing, before the state root, the block hash and the DB write. This is the
+      low-latency path: for a 19-tx block the first tx's logs arrive ~18ms before the BLOCK record.
+      Tx:      block_number u64, tx_index u32, first_log_index u32, tx_hash[32], status u8,
+               log_count u32, logs[]
+
+    Log (both records): address[20], topic_count u8, topics[topic_count][32],
+                        data_len u32, data[data_len]
 
   Handshake on the socket: magic(8) version(4) header_size(4) capacity(8), with two SCM_RIGHTS fds
   in order: [0] shared memory, [1] eventfd.
 
-Two fields the binary format does NOT carry and that we therefore derive, exactly as the chain
-numbers them: `transactionIndex` is the receipt's position in the block, and `logIndex` is a running
-count over ALL logs of the block (not per-transaction). That makes these events dedup correctly in
-EventListenerAgregator against the same log arriving over WSS/IPC.
+TX records are SPECULATIVE: they are emitted before the block is known to be good, so a block can in
+principle be abandoned after we have already delivered its logs (rare — whole-block filter rejection,
+balance-delta mismatch, or an error). An individual tx is never retracted on its own on the follower
+path. We deliver TX records immediately anyway, because that is the entire point of this listener;
+the BLOCK record that follows is the reconciliation point, and since both carry the same
+(transactionHash, logIndex) the aggregator's existing dedup collapses them into one event.
+
+`transactionIndex` and `logIndex` are numbered exactly as the chain does — logIndex counts over ALL
+logs of the block, not per-transaction — so events dedup correctly in EventListenerAgregator against
+the same log arriving over WSS/IPC. BLOCK records derive both by walking the block; TX records carry
+tx_index and first_log_index explicitly, because a TX record cannot see the rest of the block.
+
+`blockHash` is not known when a TX record is emitted (the block is not finalised yet), so those
+events carry blockHash=None. BLOCK records carry the real hash.
 """
 import array
 import mmap
@@ -51,8 +72,11 @@ from utils.TimedRecords import TIME_TAG_WS_RECEIVED
 from utils.hot_loop import HOT_LOOP, on_hot_loop, spawn
 
 MAGIC = b"NITRORB1"
-VERSION = 2
+VERSION = 3
 HEADER_SIZE = 4096
+
+RECORD_BLOCK = 0x01
+RECORD_TX = 0x02
 
 OFF_MAGIC = 0
 OFF_VERSION = 8
@@ -412,13 +436,41 @@ class ReceiptExportEventListener(EventListener):
             self._last_dropped = dropped
 
     def _dispatch_block(self, payload: bytes, received_time: float) -> None:
+        """Route one ring record by its leading type byte."""
+        record_type = payload[0]
+        if record_type == RECORD_TX:
+            self._dispatch_tx(payload, received_time)
+        elif record_type == RECORD_BLOCK:
+            self._dispatch_full_block(payload, received_time)
+        else:
+            # Unknown type: skip it rather than desync. A newer node may add records we predate.
+            APP_LOG.warning(f"{self} unknown record type 0x{record_type:02x} ({len(payload)} bytes); skipping")
+
+    def _dispatch_tx(self, payload: bytes, received_time: float) -> None:
+        """One transaction's logs, streamed the moment that tx executed (the fast path).
+
+        Arrives before the block is finalised, so there is no block hash to report. tx_index and
+        first_log_index come off the wire because this record cannot see the rest of the block.
+        """
+        o = 1                                                # record type
+        block_number = _U64.unpack_from(payload, o)[0]; o += 8
+        tx_index = _U32.unpack_from(payload, o)[0]; o += 4
+        log_index = _U32.unpack_from(payload, o)[0]; o += 4
+        tx_hash = "0x" + payload[o:o + 32].hex(); o += 32
+        o += 1                                               # status (unused: logs of a failed tx are reverted)
+        log_count = _U32.unpack_from(payload, o)[0]; o += 4
+
+        self._emit_logs(payload, o, log_count, block_number, None, tx_hash,
+                        tx_index, log_index, received_time)
+
+    def _dispatch_full_block(self, payload: bytes, received_time: float) -> None:
         """Walk one block's binary receipts, delivering only the logs we are registered for.
 
         Deliberately does not build dicts for logs nobody wants: the address and topic0 are read
         first and matched against the index, and the full event is materialised only on a hit. A
         block's logs must still be walked in order because every field is variable-length.
         """
-        o = 0
+        o = 1                                                # record type
         block_number = _U64.unpack_from(payload, o)[0]; o += 8
         block_hash = "0x" + payload[o:o + 32].hex(); o += 32
         o += 32                                              # parent_hash (unused)
@@ -426,7 +478,6 @@ class ReceiptExportEventListener(EventListener):
         o += 4                                               # tx_count (unused)
         receipt_count = _U32.unpack_from(payload, o)[0]; o += 4
 
-        index = self._index
         log_index = 0                                        # block-wide, matching chain semantics
         self._blocks_seen += 1
 
@@ -437,42 +488,56 @@ class ReceiptExportEventListener(EventListener):
             o += 32                                          # effective_gas_price
             log_count = _U32.unpack_from(payload, o)[0]; o += 4
 
-            for _ in range(log_count):
-                addr_raw = payload[o:o + 20]; o += 20
-                topic_count = payload[o]; o += 1
-                topics_at = o
-                o += 32 * topic_count
-                data_len = _U32.unpack_from(payload, o)[0]; o += 4
-                data_at = o
-                o += data_len
+            o, log_index = self._emit_logs(payload, o, log_count, block_number, block_hash, tx_hash,
+                                           tx_index, log_index, received_time)
 
-                this_log_index = log_index
-                log_index += 1
+    def _emit_logs(self, payload: bytes, o: int, log_count: int, block_number: int,
+                   block_hash: Optional[str], tx_hash: str, tx_index: int,
+                   log_index: int, received_time: float) -> Tuple[int, int]:
+        """Walk log_count logs at offset o, delivering the ones we are registered for.
 
-                if topic_count == 0:
-                    continue
-                regs = index.get(("0x" + addr_raw.hex(), "0x" + payload[topics_at:topics_at + 32].hex()))
-                if not regs:
-                    continue
+        Shared by both record types so the two paths can never disagree about the log layout or the
+        index numbering. Returns the offset just past the last log and the next block-wide logIndex.
+        """
+        index = self._index
+        for _ in range(log_count):
+            addr_raw = payload[o:o + 20]; o += 20
+            topic_count = payload[o]; o += 1
+            topics_at = o
+            o += 32 * topic_count
+            data_len = _U32.unpack_from(payload, o)[0]; o += 4
+            data_at = o
+            o += data_len
 
-                log = {
-                    "address": "0x" + addr_raw.hex(),
-                    "topics": ["0x" + payload[topics_at + 32 * i:topics_at + 32 * (i + 1)].hex()
-                               for i in range(topic_count)],
-                    "data": "0x" + payload[data_at:data_at + data_len].hex(),
-                    "blockNumber": block_number,
-                    "blockHash": block_hash,
-                    "transactionHash": tx_hash,
-                    # Neither index is in the wire format: transactionIndex is the receipt's position
-                    # in the block and logIndex counts every log of the block, which is how the chain
-                    # numbers them — so these dedup exactly against the same log seen over WSS/IPC.
-                    "transactionIndex": tx_index,
-                    "logIndex": this_log_index,
-                    "removed": False,
-                }
-                for registration in regs:
-                    self._parse_event_and_call_cb(registration, log, received_time)
-                self._events_delivered += 1
+            this_log_index = log_index
+            log_index += 1
+
+            if topic_count == 0:
+                continue
+            regs = index.get(("0x" + addr_raw.hex(), "0x" + payload[topics_at:topics_at + 32].hex()))
+            if not regs:
+                continue
+
+            log = {
+                "address": "0x" + addr_raw.hex(),
+                "topics": ["0x" + payload[topics_at + 32 * i:topics_at + 32 * (i + 1)].hex()
+                           for i in range(topic_count)],
+                "data": "0x" + payload[data_at:data_at + data_len].hex(),
+                "blockNumber": block_number,
+                # None on the streamed TX path: the block is not finalised, so it has no hash yet.
+                "blockHash": block_hash,
+                "transactionHash": tx_hash,
+                # transactionIndex is the receipt's position in the block and logIndex counts every
+                # log of the block, which is how the chain numbers them — so these dedup exactly
+                # against the same log seen over WSS/IPC, and against the BLOCK record that follows.
+                "transactionIndex": tx_index,
+                "logIndex": this_log_index,
+                "removed": False,
+            }
+            for registration in regs:
+                self._parse_event_and_call_cb(registration, log, received_time)
+            self._events_delivered += 1
+        return o, log_index
 
     def _parse_event_and_call_cb(self, registration: EventListenerRegistration,
                                  log: dict, received_time: float) -> None:

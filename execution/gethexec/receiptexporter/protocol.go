@@ -53,13 +53,39 @@
 // written, so once the consumer observes an advanced `tail` (with acquire
 // ordering) the full record is guaranteed to be present.
 //
-// The payload itself is a compact little-endian binary encoding of one block's
-// receipts (chosen over JSON to minimise producer-side serialisation cost); see
-// payload.go for the exact layout. The ring framing is payload-agnostic.
+// The payload itself is a compact little-endian binary encoding (chosen over
+// JSON to minimise producer-side serialisation cost); see payload.go for the
+// exact layout. The ring framing is payload-agnostic.
 //
-// # Payload layout (protocol version 2, little-endian unless noted)
+// # Record types (protocol version 3)
+//
+// Every payload starts with a one-byte record type:
+//
+//	0x01 RecordBlock  one block's full receipts, published once the block is
+//	                  built. Authoritative: carries the block hash and every
+//	                  receipt field.
+//	0x02 RecordTx     one transaction's logs, published from inside the block
+//	                  loop the instant that tx finishes executing - before the
+//	                  state root, the block hash, and the DB write. This is the
+//	                  low-latency path: for a 19-tx block the first tx's logs go
+//	                  out ~18ms before the block record does.
+//
+// A RecordTx is SPECULATIVE. It is emitted before the block is known to be
+// good, so a consumer acting on one must tolerate the block being abandoned
+// afterwards (rare: whole-block filter rejection, a balance-delta mismatch, or
+// an error). The matching RecordBlock is the reconciliation point - it is only
+// published if the block was actually committed. On the follower/digest path an
+// individual tx is never retracted on its own, because NoopSequencingHooks
+// reports SupportsGroupRollback() == false, so the group-rollback that truncates
+// receipts mid-loop can never fire there.
+//
+// RecordTx carries no block hash (not yet computed) and no gas figures; it is
+// for log delivery only. Everything else comes from the RecordBlock.
+//
+// # RecordBlock payload (little-endian unless noted)
 //
 //	Block:
+//	  record_type          u8            = 0x01
 //	  block_number         u64
 //	  block_hash           [32]byte
 //	  parent_hash          [32]byte
@@ -85,6 +111,22 @@
 //	  data_len             u32
 //	  data                 [data_len]byte
 //
+// # RecordTx payload (little-endian)
+//
+//	record_type            u8            = 0x02
+//	block_number           u64
+//	tx_index               u32           position of this tx's receipt in the block
+//	first_log_index        u32           block-wide log index of this tx's first log
+//	tx_hash                [32]byte
+//	status                 u8            (0 = failed, 1 = success)
+//	log_count              u32
+//	logs[log_count]                      same Log layout as above
+//
+// tx_index and first_log_index are supplied so a consumer can reproduce the
+// chain's own transactionIndex/logIndex numbering (logIndex counts every log in
+// the block, not per-transaction) and therefore dedup a log delivered here
+// against the same log arriving later over RPC or in the RecordBlock.
+//
 // # Handshake
 //
 // When a consumer connects to the unix socket the producer replies with a
@@ -103,7 +145,13 @@ const (
 
 	// ProtocolVersion is bumped on any incompatible layout change.
 	// v2: binary receipt payload (was JSON in v1).
-	ProtocolVersion = 2
+	// v3: every payload is prefixed with a record-type byte, and per-tx log
+	//     records (RecordTx) are streamed from inside the block loop.
+	ProtocolVersion = 3
+
+	// Record types, the first byte of every payload.
+	RecordBlock = 0x01
+	RecordTx    = 0x02
 
 	// Header field offsets.
 	offMagic      = 0
