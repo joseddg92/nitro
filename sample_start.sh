@@ -151,7 +151,7 @@ exec /home/robinhood/nitro \
   --node.resource-mgmt.mem-free-limit=2GB \
   \
   `# ---------- chain / connectivity (unchanged) ----------` \
-  --parent-chain.connection.url=https://eth1.lava.build/ \
+  --parent-chain.connection.url=https://eth.drpc.org \
   --parent-chain.blob-client.beacon-url=https://eth-mainnetbeacon.g.alchemy.com/v2/Oz73zu-SDlEhvQKmY-lusVERM6_tne9k \
   --chain.info-json="$CHAIN_INFO" \
   --chain.name="$CHAIN_NAME" \
