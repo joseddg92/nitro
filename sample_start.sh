@@ -3,13 +3,23 @@ set -euo pipefail
 
 # =============================================================================
 # Nitro node launcher — tuned for:
-#   Host   : AWS EC2, Intel Xeon E5-2686 v4 @ 2.30GHz, 4 vCPU (2 cores + HT)
+#   Host   : AWS EC2 (KVM), Intel Xeon Platinum 8559C @ ~3.2GHz, 4 vCPU
+#            (1 socket, 2 cores, HT on -> 4 threads; AVX-512F/DQ/VL/BW/CD/VNNI,
+#            AVX2, BMI1/2, FMA all present -- see `lscpu`)
 #   RAM    : 30 GiB, dedicated to this node
 #   Role   : full RPC node (staker disabled, forwards txs to the sequencer)
 #   Scheme : pathdb (non-archive)
 #
 # Tuning follows:
 #   https://docs.arbitrum.io/run-arbitrum-node/nitro/node-tuning-and-monitoring
+#
+# Everything below the memory-budget block is aimed specifically at driving
+# down arb/block/sendipc (execute + receipt-IPC-publish latency, see
+# arb/block/waittime for the queueing time this deliberately excludes). Cache
+# sizes are a reasoned starting point, not a benchmarked optimum -- this host
+# has no synthetic load generator, so re-tune them by watching
+# arb/block/execution and arb/block/sendipc on the real feed and adjusting
+# from there rather than trusting these numbers blindly.
 # =============================================================================
 
 CHAIN_INFO="$(jq -r '.chain."info-json"' /home/robinhood/robinhood-nodeConfig.json)"
@@ -20,21 +30,29 @@ CHAIN_NAME="$(jq -r '.chain.name'      /home/robinhood/robinhood-nodeConfig.json
 # -----------------------------------------------------------------------------
 #   Pebble block cache   (CGO)        database-cache            2048
 #   Pebble memtables     (CGO)        database-cache / 2        1024
-#   Trie-clean cache     (mmap)       trie-clean-cache          1024
-#   Snapshot cache       (mmap)       snapshot-cache             512
-#   Stylus WASM cache    (Rust/CGO)   stylus-lru-cache-capacity  256   (default)
+#   Trie-clean cache     (mmap)       trie-clean-cache          1536  (was 1024)
+#   Snapshot cache       (mmap)       snapshot-cache            1024  (was  512)
+#   Stylus WASM cache    (Rust/CGO)   stylus-lru-cache-capacity  384  (was  256)
 #   glibc malloc arenas               MALLOC_ARENA_MAX=2         128
 #   Native thread stacks                                         300
 #                                                             ------
-#   Non-Go total                                                5292 MiB
+#   Non-Go total                                                6444 MiB
 #
 #   GOMEMLIMIT ............................................... 16384 MiB
-#   Worst-case Nitro RSS ~ 16384 + 5292 ....................  ~21.2 GiB
-#   Left for kernel, page cache, sshd, agents ...............   ~8.8 GiB
+#   Worst-case Nitro RSS ~ 16384 + 6444 ....................  ~22.3 GiB
+#   Left for kernel, page cache, sshd, agents ...............   ~7.7 GiB
 #
 # This is deliberately *below* what the doc's container formula would give
 # (~24 GiB). On bare metal there is no cgroup limit to protect us, and the OS
 # page cache in front of EBS is worth more on a 4-vCPU box than a larger Go heap.
+#
+# snapshot-cache and trie-clean-cache were raised from their previous values:
+# a snapshot-cache hit answers a state read in one lookup, where a miss falls
+# through to a multi-level trie walk -- state reads inside ProduceBlockAdvanced
+# are the dominant cost of arb/block/execution (and therefore arb/block/sendipc),
+# so a higher hit rate there is the most direct lever this file has over it.
+# Kept modest (not maxed out) to preserve OS page-cache headroom in front of the
+# persistent.chain disk, which matters just as much on a 4-vCPU box.
 # -----------------------------------------------------------------------------
 
 # Cap glibc malloc arenas. Default is 8 x CPU_count (= 32 here) x 64 MiB = 2 GiB
@@ -51,9 +69,25 @@ export GOMEMLIMIT=16384MiB
 # GOMEMLIMIT remains the real backstop. Do NOT lower this below 100.
 export GOGC=400
 
-# GOMAXPROCS deliberately unset. Go auto-detects 4 logical CPUs, which is
-# correct for a bare-metal main node. (The x2 multiplier in the docs is a
+# Pinned explicitly rather than left to auto-detection: `nproc` already
+# resolves to 4 here, but this host is a KVM guest, and pinning removes any
+# dependency on that continuing to be true if the guest's vCPU count or cgroup
+# view ever changes underneath the script. (The x2 multiplier in the docs is a
 # validator-only recommendation; this node is not a validator.)
+export GOMAXPROCS=4
+
+# Skip the runtime's pointer-passing safety checks on cgo calls. Every block
+# with a Stylus call or a brotli/BLS operation crosses into C/Rust through cgo;
+# cgocheck's scan is pure overhead once that code is trusted, and it runs
+# inline on the same goroutine doing the call -- i.e. inside arb/block/execution.
+export GODEBUG=cgocheck=0
+
+# Best-effort: ask the kernel to prefer scheduling this process's threads over
+# others on the box (e.g. this script's own `jq` calls, sshd, agents) when all
+# 4 vCPUs are momentarily contended, so scheduling delay doesn't show up as
+# arb/block/waittime or lengthen arb/block/execution. Silently a no-op without
+# CAP_SYS_NICE / root -- not worth failing startup over.
+renice -n -5 -p $$ >/dev/null 2>&1 || true
 
 # Raise the file-descriptor limit as far as the hard limit allows (Pebble keeps
 # many SSTs open). Never fatal if the hard limit is low.
@@ -72,9 +106,9 @@ exec /home/robinhood/nitro \
   `# ---------- caches (sized for 30 GiB, non-archive) ----------` \
   --execution.caching.database-cache=2048 \
   --execution.caching.trie-dirty-cache=1024 \
-  --execution.caching.trie-clean-cache=1024 \
-  --execution.caching.snapshot-cache=512 \
-  --execution.caching.stylus-lru-cache-capacity=256 \
+  --execution.caching.trie-clean-cache=1536 \
+  --execution.caching.snapshot-cache=1024 \
+  --execution.caching.stylus-lru-cache-capacity=384 \
   --execution.caching.state-scheme=path \
   `# pathdb forces a flush every N blocks; at ~10 blocks/s the default 128 put a` \
   `# ~100ms writetodb stall every ~13s. 32 trades more frequent, smaller flushes` \
@@ -82,6 +116,23 @@ exec /home/robinhood/nitro \
   --execution.caching.pathdb-max-diff-layers=32 \
   \
   --persistent.handles=2048 \
+  \
+  `# ---------- lowest-latency block pipeline (arb/block/sendipc) ----------` \
+  `# Speculatively execute msg+1 in the background while msg is mid-commit, so` \
+  `# by the time msg+1 reaches DigestMessage its state reads are already warm.` \
+  `# This is the default already; pinned explicitly so an upgrade can't` \
+  `# silently flip it off underneath this tuning.` \
+  --execution.enable-prefetch-block=true \
+  `# Stylus programs are JIT-compiled once per (module, target) and cached; the` \
+  `# built-in default target (x86_64-linux-unknown+sse4.2+lzcnt+bmi) is deliberately` \
+  `# conservative for portability across arbitrary deploy hosts. This host's actual` \
+  `# CPU features (see lscpu / header above) let the compiler emit AVX2/FMA/BMI2 and` \
+  `# AVX-512F/DQ/VL directly, which matters for Stylus contracts doing real compute` \
+  `# -- that execution happens inside arb/block/execution, same as everything else` \
+  `# in ProduceBlockAdvanced. avx512bw/cd/vnni are NOT set: the vendored wasmer` \
+  `# CpuFeature enum (crates/tools/wasmer/lib/types/src/target.rs) only models` \
+  `# avx512f/dq/vl, so those are the ceiling regardless of what the CPU supports.` \
+  --execution.stylus-target.amd64="x86_64-linux-unknown+sse4.2+lzcnt+bmi+bmi2+popcnt+avx+avx2+fma+avx512f+avx512dq+avx512vl" \
   \
   `# ---------- OOM protection: throttle RPC when free RAM is low ----------` \
   --node.resource-mgmt.mem-free-limit=2GB \
