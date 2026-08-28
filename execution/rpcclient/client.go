@@ -6,6 +6,7 @@ package rpcclient
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/node"
@@ -62,8 +63,8 @@ func sendRequest[T any](c *Client, method string, args ...any) containers.Promis
 	})
 }
 
-func (c *Client) DigestMessage(msgIdx arbutil.MessageIndex, msg *arbostypes.MessageWithMetadata, msgForPrefetch *arbostypes.MessageWithMetadata) containers.PromiseInterface[*execution.MessageResult] {
-	return sendRequest[*execution.MessageResult](c, "_digestMessage", msgIdx, msg, msgForPrefetch)
+func (c *Client) DigestMessage(msgIdx arbutil.MessageIndex, msg *arbostypes.MessageWithMetadata, msgForPrefetch *arbostypes.MessageWithMetadata, receivedAt time.Time) containers.PromiseInterface[*execution.MessageResult] {
+	return sendRequest[*execution.MessageResult](c, "_digestMessage", msgIdx, msg, msgForPrefetch, receivedAt)
 }
 
 func (c *Client) Reorg(msgIdxOfFirstMsgToAdd arbutil.MessageIndex, newMessages []arbostypes.MessageWithMetadataAndBlockInfo, oldMessages []*arbostypes.MessageWithMetadata) containers.PromiseInterface[[]*execution.MessageResult] {

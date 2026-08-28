@@ -4,6 +4,7 @@ package rpcserver
 
 import (
 	"context"
+	"time"
 
 	"github.com/ethereum/go-ethereum/core/rawdb"
 
@@ -21,8 +22,8 @@ func NewServer(executionClient execution.ExecutionClient, executionRecorder exec
 	return &Server{executionClient, executionRecorder}
 }
 
-func (c *Server) DigestMessage(ctx context.Context, msgIdx arbutil.MessageIndex, msg *arbostypes.MessageWithMetadata, msgForPrefetch *arbostypes.MessageWithMetadata) (*execution.MessageResult, error) {
-	return c.executionClient.DigestMessage(msgIdx, msg, msgForPrefetch).Await(ctx)
+func (c *Server) DigestMessage(ctx context.Context, msgIdx arbutil.MessageIndex, msg *arbostypes.MessageWithMetadata, msgForPrefetch *arbostypes.MessageWithMetadata, receivedAt time.Time) (*execution.MessageResult, error) {
+	return c.executionClient.DigestMessage(msgIdx, msg, msgForPrefetch, receivedAt).Await(ctx)
 }
 
 func (c *Server) Reorg(ctx context.Context, msgIdxOfFirstMsgToAdd arbutil.MessageIndex, newMessages []arbostypes.MessageWithMetadataAndBlockInfo, oldMessages []*arbostypes.MessageWithMetadata) ([]*execution.MessageResult, error) {

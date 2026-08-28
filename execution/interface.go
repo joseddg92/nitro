@@ -49,7 +49,10 @@ var ErrSequencerInsertLockTaken = errors.New("insert lock taken")
 type ExecutionClient interface {
 	ArbOSVersionGetter
 
-	DigestMessage(msgIdx arbutil.MessageIndex, msg *arbostypes.MessageWithMetadata, msgForPrefetch *arbostypes.MessageWithMetadata) containers.PromiseInterface[*MessageResult]
+	// receivedAt is when this message was durably queued locally (e.g. written after
+	// arriving over the feed); zero if unknown (e.g. sequencer-originated messages).
+	// Used only to populate the arb/block/waittime metric.
+	DigestMessage(msgIdx arbutil.MessageIndex, msg *arbostypes.MessageWithMetadata, msgForPrefetch *arbostypes.MessageWithMetadata, receivedAt time.Time) containers.PromiseInterface[*MessageResult]
 	Reorg(msgIdxOfFirstMsgToAdd arbutil.MessageIndex, newMessages []arbostypes.MessageWithMetadataAndBlockInfo, oldMessages []*arbostypes.MessageWithMetadata) containers.PromiseInterface[[]*MessageResult]
 	HeadMessageIndex() containers.PromiseInterface[arbutil.MessageIndex]
 	ResultAtMessageIndex(msgIdx arbutil.MessageIndex) containers.PromiseInterface[*MessageResult]

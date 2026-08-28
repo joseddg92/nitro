@@ -92,6 +92,15 @@ type TransactionStreamer struct {
 	// (e.g. during sync, broadcast-feed lead, or inbox reorg windows). Single-goroutine
 	// access via the executeMessages loop, so no lock is needed.
 	accNotFoundErrHandler *util.EphemeralErrorHandler
+
+	// recvTimes records when each message was durably queued locally (i.e. just
+	// after writeMessages wrote it), keyed by message index. ExecuteNextMsg
+	// consumes (looks up and deletes) the entry for the message it's about to
+	// digest and forwards it to the execution engine, which uses it to populate
+	// the arb/block/waittime metric. Bounded by backlog depth: an entry is
+	// created on write and removed on consumption.
+	recvTimesMutex sync.Mutex
+	recvTimes      map[arbutil.MessageIndex]time.Time
 }
 
 type TransactionStreamerConfig struct {
@@ -149,6 +158,7 @@ func NewTransactionStreamer(
 		broadcastServer:    broadcastServer,
 		fatalErrChan:       fatalErrChan,
 		config:             config,
+		recvTimes:          make(map[arbutil.MessageIndex]time.Time),
 		accNotFoundErrHandler: util.NewEphemeralErrorHandler(
 			5*time.Minute, AccumulatorNotFoundErr.Error(), time.Minute,
 		),
@@ -1335,6 +1345,16 @@ func (s *TransactionStreamer) writeMessages(firstMsgIdx arbutil.MessageIndex, me
 		return err
 	}
 
+	// Stamp when each message became durably available locally, so ExecuteNextMsg
+	// can report arb/block/waittime once it digests each one.
+	now := time.Now()
+	s.recvTimesMutex.Lock()
+	for i := range messages {
+		// #nosec G115
+		s.recvTimes[firstMsgIdx+arbutil.MessageIndex(i)] = now
+	}
+	s.recvTimesMutex.Unlock()
+
 	select {
 	case s.newMessageNotifier <- struct{}{}:
 	default:
@@ -1518,7 +1538,11 @@ func (s *TransactionStreamer) ExecuteNextMsg(ctx context.Context) bool {
 	// Reset on the success path: a later AccumulatorNotFoundErr should start a
 	// fresh throttle window, not reuse a stale FirstOccurrence.
 	s.accNotFoundErrHandler.Reset()
-	msgResult, err := s.exec.DigestMessage(msgIdxToExecute, &msgAndBlockInfo.MessageWithMeta, msgForPrefetch).Await(ctx)
+	s.recvTimesMutex.Lock()
+	receivedAt := s.recvTimes[msgIdxToExecute]
+	delete(s.recvTimes, msgIdxToExecute)
+	s.recvTimesMutex.Unlock()
+	msgResult, err := s.exec.DigestMessage(msgIdxToExecute, &msgAndBlockInfo.MessageWithMeta, msgForPrefetch, receivedAt).Await(ctx)
 	if err != nil {
 		logger := log.Warn
 		if (prevHeadMsgIdx == nil) || (*prevHeadMsgIdx < consensusHeadMsgIdx) {

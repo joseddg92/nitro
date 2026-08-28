@@ -70,6 +70,8 @@ var (
 	totalMultiGasUsedSinceStartupCounter = metrics.NewRegisteredCounter("arb/multigas_used/total", nil)
 	blockExecutionTimer                  = metrics.NewRegisteredHistogram("arb/block/execution", nil, metrics.NewBoundedHistogramSample())
 	blockWriteToDbTimer                  = metrics.NewRegisteredHistogram("arb/block/writetodb", nil, metrics.NewBoundedHistogramSample())
+	blockSendIPCTimer                    = metrics.NewRegisteredHistogram("arb/block/sendipc", nil, metrics.NewBoundedHistogramSample())
+	blockWaitTimer                       = metrics.NewRegisteredHistogram("arb/block/waittime", nil, metrics.NewBoundedHistogramSample())
 )
 
 var (
@@ -560,7 +562,9 @@ func (s *ExecutionEngine) Reorg(msgIdxOfFirstMsgToAdd arbutil.MessageIndex, newM
 			msgForPrefetch = &newMessages[i].MessageWithMeta
 		}
 		nextMsgIdx := msgIdxOfFirstMsgToAdd + arbutil.MessageIndex(i)
-		msgResult, err := s.digestMessageWithBlockMutex(nextMsgIdx, &newMessages[i].MessageWithMeta, msgForPrefetch)
+		// Resequencing after a reorg has no feed-received timestamp; arb/block/waittime
+		// isn't recorded for these blocks (zero time.Time).
+		msgResult, err := s.digestMessageWithBlockMutex(nextMsgIdx, &newMessages[i].MessageWithMeta, msgForPrefetch, time.Time{})
 		if err != nil {
 			return nil, err
 		}
@@ -835,7 +839,8 @@ func (s *ExecutionEngine) sequenceTransactionsWithBlockMutex(header *arbostypes.
 
 	// Only write the block after we've written the messages, so if the node dies in the middle of this,
 	// it will naturally recover on startup by regenerating the missing block.
-	err = s.appendBlock(block, statedb, receipts, blockCalcTime)
+	// arb/block/sendipc isn't recorded for sequencer-originated blocks (zero time.Time).
+	err = s.appendBlock(block, statedb, receipts, blockCalcTime, time.Time{})
 	if err != nil {
 		return nil, err
 	}
@@ -912,7 +917,7 @@ func (s *ExecutionEngine) sequenceDelayedMessageWithBlockMutex(message *arbostyp
 		return nil, err
 	}
 
-	err = s.appendBlock(block, statedb, receipts, blockCalcTime)
+	err = s.appendBlock(block, statedb, receipts, blockCalcTime, time.Time{})
 	if err != nil {
 		return nil, err
 	}
@@ -1070,7 +1075,10 @@ func (s *ExecutionEngine) createBlockFromNextMessage(msg *arbostypes.MessageWith
 }
 
 // must hold createBlockMutex
-func (s *ExecutionEngine) appendBlock(block *types.Block, statedb *state.StateDB, receipts types.Receipts, duration time.Duration) error {
+// execStartTime is when execution of the block being appended began (the same
+// instant blockExecutionTimer's duration is measured from); zero for
+// sequencer-originated blocks, which don't record arb/block/sendipc.
+func (s *ExecutionEngine) appendBlock(block *types.Block, statedb *state.StateDB, receipts types.Receipts, duration time.Duration, execStartTime time.Time) error {
 	// Export the block's receipts to any co-located consumer BEFORE the durable
 	// DB write, to minimise notification latency. This runs inline on the
 	// (createBlocksMutex-serialised) commit path and is non-blocking. Note the
@@ -1078,6 +1086,15 @@ func (s *ExecutionEngine) appendBlock(block *types.Block, statedb *state.StateDB
 	// the consumer may have observed a block that is subsequently retried.
 	if s.receiptExporter != nil {
 		s.receiptExporter.PublishBlockReceipts(block, receipts)
+	}
+
+	// arb/block/sendipc measures execute + IPC-publish only: from execStartTime
+	// (the same start point as arb/block/execution) to just after receipts were
+	// published above. Deliberately excludes any wait for the message to become
+	// available (that's a separate, highly variable idle time, not processing
+	// latency) and excludes the durable DB write below.
+	if !execStartTime.IsZero() {
+		blockSendIPCTimer.Update(time.Since(execStartTime).Nanoseconds())
 	}
 
 	var logs []*types.Log
@@ -1235,15 +1252,26 @@ func (s *ExecutionEngine) cacheL1PriceDataOfMsg(msgIdx arbutil.MessageIndex, blo
 // in parallel, creates a block by executing msgForPrefetch (msg+1) against the latest state
 // but does not store the block.
 // This helps in filling the cache, so that the next block creation is faster.
-func (s *ExecutionEngine) DigestMessage(msgIdx arbutil.MessageIndex, msg *arbostypes.MessageWithMetadata, msgForPrefetch *arbostypes.MessageWithMetadata) (*execution.MessageResult, error) {
+// receivedAt is when msg was durably queued locally (e.g. just after arriving
+// over the feed); zero if unknown. Used only to populate arb/block/waittime.
+func (s *ExecutionEngine) DigestMessage(msgIdx arbutil.MessageIndex, msg *arbostypes.MessageWithMetadata, msgForPrefetch *arbostypes.MessageWithMetadata, receivedAt time.Time) (*execution.MessageResult, error) {
 	if !s.createBlocksMutex.TryLock() {
 		return nil, errors.New("createBlock mutex held")
 	}
 	defer s.createBlocksMutex.Unlock()
-	return s.digestMessageWithBlockMutex(msgIdx, msg, msgForPrefetch)
+	return s.digestMessageWithBlockMutex(msgIdx, msg, msgForPrefetch, receivedAt)
 }
 
-func (s *ExecutionEngine) digestMessageWithBlockMutex(msgIdxToDigest arbutil.MessageIndex, msg *arbostypes.MessageWithMetadata, msgForPrefetch *arbostypes.MessageWithMetadata) (*execution.MessageResult, error) {
+func (s *ExecutionEngine) digestMessageWithBlockMutex(msgIdxToDigest arbutil.MessageIndex, msg *arbostypes.MessageWithMetadata, msgForPrefetch *arbostypes.MessageWithMetadata, receivedAt time.Time) (*execution.MessageResult, error) {
+	// arb/block/waittime: everything between the message becoming available
+	// locally and the execution engine actually starting on it - streamer poll
+	// delay, its own bookkeeping, the DigestMessage call/mutex acquisition.
+	// Not recorded when receivedAt is unknown (e.g. sequencer/reorg paths never
+	// reach this function with a non-zero value; see the Reorg call site).
+	if !receivedAt.IsZero() {
+		blockWaitTimer.Update(time.Since(receivedAt).Nanoseconds())
+	}
+
 	currentHeader, err := s.getCurrentHeader()
 	if err != nil {
 		return nil, err
@@ -1273,7 +1301,7 @@ func (s *ExecutionEngine) digestMessageWithBlockMutex(msgIdxToDigest arbutil.Mes
 	blockCalcTime := time.Since(startTime)
 	blockExecutionTimer.Update(blockCalcTime.Nanoseconds())
 
-	err = s.appendBlock(block, statedb, receipts, blockCalcTime)
+	err = s.appendBlock(block, statedb, receipts, blockCalcTime, startTime)
 	if err != nil {
 		return nil, err
 	}
