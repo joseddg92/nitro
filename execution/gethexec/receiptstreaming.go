@@ -76,6 +76,16 @@ func (h *streamingSequencingHooks) PostTxFilter(
 	// returns. The block hash is not known yet, so pass the zero hash; the real
 	// one is written over it later by ProduceBlockAdvanced's touch-up pass, so
 	// nothing downstream ever observes the placeholder.
+	// Carry the brotli level forward for the next block's calldata-units
+	// prewarming. Taken from the arbState already open here, so this costs a
+	// storage read the block loop was going to do anyway, and only once per
+	// block rather than per transaction. See sender_prewarm.go.
+	if positionInBlock == 0 && arbState != nil {
+		if level, err := arbState.BrotliCompressionLevel(); err == nil {
+			setObservedBrotliLevel(level)
+		}
+	}
+
 	logs := statedb.GetLogs(tx.Hash(), header.Number.Uint64(), common.Hash{}, header.Time)
 	if len(logs) > 0 {
 		status := types.ReceiptStatusSuccessful

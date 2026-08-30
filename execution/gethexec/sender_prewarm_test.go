@@ -14,6 +14,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 
+	"github.com/offchainlabs/nitro/arbos/l1pricing"
 	"github.com/offchainlabs/nitro/cmd/chaininfo"
 )
 
@@ -142,4 +143,95 @@ func TestPrewarmSendersNoopOnTinyBlocks(t *testing.T) {
 		t.Fatal(err)
 	}
 	prewarmSenders(cfg, parent, params.MaxArbosVersionSupported, signedTxs(t, signer, key, 1))
+}
+
+// --- calldata-units prewarming -------------------------------------------------
+
+// Level 0 is ArbOS's default, so it must be a usable level and not read as
+// "unobserved". This is the bug the level+1 encoding exists to prevent.
+func TestObservedBrotliLevelZeroIsUsable(t *testing.T) {
+	observedBrotliLevel.Store(0)
+	if _, ok := loadObservedBrotliLevel(); ok {
+		t.Fatal("zero value must mean 'not yet observed'")
+	}
+	setObservedBrotliLevel(0)
+	level, ok := loadObservedBrotliLevel()
+	if !ok || level != 0 {
+		t.Fatalf("level 0 must round-trip as observed, got level=%d ok=%v", level, ok)
+	}
+	setObservedBrotliLevel(11)
+	if level, ok := loadObservedBrotliLevel(); !ok || level != 11 {
+		t.Fatalf("level 11 round-trip failed, got level=%d ok=%v", level, ok)
+	}
+}
+
+// What prewarming caches must equal what the block loop would compute itself.
+func TestPrewarmCalldataUnitsMatchesSerialComputation(t *testing.T) {
+	cfg := prewarmTestChainConfig()
+	signer := types.MakeSigner(cfg, big.NewInt(1_000_001), uint64(time.Now().Unix()), params.MaxArbosVersionSupported)
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	txes := signedTxs(t, signer, key, 4)
+
+	const level = 0
+	setObservedBrotliLevel(level)
+	prewarmCalldataUnits(txes, 0, 1)
+
+	for i, tx := range txes {
+		cached := tx.GetCachedCalldataUnits(level)
+		want, err := l1pricing.PosterUnitsForTx(tx, l1pricing.BatchPosterAddress, level)
+		if err != nil {
+			t.Fatalf("tx %d: %v", i, err)
+		}
+		// Non-poster txs legitimately yield 0 units, which the cache treats as
+		// empty; only assert when there is something to cache.
+		if want != 0 {
+			if cached == nil {
+				t.Fatalf("tx %d: expected a cached value", i)
+			}
+			if *cached != want {
+				t.Fatalf("tx %d: cached %d, serial computation %d", i, *cached, want)
+			}
+		}
+	}
+}
+
+// A stale/wrong level must miss rather than hand back the wrong units.
+func TestPrewarmCalldataUnitsWrongLevelMisses(t *testing.T) {
+	cfg := prewarmTestChainConfig()
+	signer := types.MakeSigner(cfg, big.NewInt(1_000_001), uint64(time.Now().Unix()), params.MaxArbosVersionSupported)
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	txes := signedTxs(t, signer, key, 4)
+
+	setObservedBrotliLevel(4) // prewarm at a level the "loop" will not ask for
+	prewarmCalldataUnits(txes, 0, 1)
+
+	for i, tx := range txes {
+		if got := tx.GetCachedCalldataUnits(11); got != nil {
+			t.Fatalf("tx %d: level 11 must miss a level-4 entry, got %d", i, *got)
+		}
+	}
+}
+
+func TestPrewarmCalldataUnitsNoopWhenUnobserved(t *testing.T) {
+	cfg := prewarmTestChainConfig()
+	signer := types.MakeSigner(cfg, big.NewInt(1_000_001), uint64(time.Now().Unix()), params.MaxArbosVersionSupported)
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	txes := signedTxs(t, signer, key, 3)
+
+	observedBrotliLevel.Store(0) // unobserved
+	prewarmCalldataUnits(txes, 0, 1)
+	for i, tx := range txes {
+		if got := tx.GetCachedCalldataUnits(0); got != nil {
+			t.Fatalf("tx %d: nothing should be cached before a level is observed, got %d", i, *got)
+		}
+	}
 }

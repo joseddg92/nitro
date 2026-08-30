@@ -515,22 +515,39 @@ func (ps *L1PricingState) UpdateForBatchPosterSpending(
 	return nil
 }
 
-func (ps *L1PricingState) getPosterUnitsWithoutCache(tx *types.Transaction, posterAddr common.Address, brotliCompressionLevel uint64) uint64 {
-
+// PosterUnitsForTx computes the L1 calldata units a transaction is charged for,
+// which requires brotli-compressing its serialised bytes.
+//
+// It depends only on the transaction, the poster and the compression level - it
+// reads no ArbOS state - so it can be computed off the block-production
+// goroutine and memoised onto the transaction with SetCachedCalldataUnits. This
+// function only computes; caching is the caller's business.
+//
+// getPosterUnitsWithoutCache delegates here so the two can never disagree about
+// how units are derived.
+func PosterUnitsForTx(tx *types.Transaction, posterAddr common.Address, brotliCompressionLevel uint64) (uint64, error) {
 	if posterAddr != BatchPosterAddress {
-		return 0
+		return 0, nil
 	}
 	txBytes, merr := tx.MarshalBinary()
 	txType := tx.Type()
 	if !util.TxTypeHasPosterCosts(txType) || merr != nil {
-		return 0
+		return 0, nil
 	}
 
 	l1Bytes, err := byteCountAfterBrotliLevel(txBytes, brotliCompressionLevel)
 	if err != nil {
+		return 0, err
+	}
+	return arbmath.SaturatingUMul(params.TxDataNonZeroGasEIP2028, l1Bytes), nil
+}
+
+func (ps *L1PricingState) getPosterUnitsWithoutCache(tx *types.Transaction, posterAddr common.Address, brotliCompressionLevel uint64) uint64 {
+	units, err := PosterUnitsForTx(tx, posterAddr, brotliCompressionLevel)
+	if err != nil {
 		panic(fmt.Sprintf("failed to compress tx: %v", err))
 	}
-	return arbmath.SaturatingUMul(params.TxDataNonZeroGasEIP2028, l1Bytes)
+	return units
 }
 
 // GetPosterInfo returns the poster cost and the calldata units for a transaction
