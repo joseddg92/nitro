@@ -387,6 +387,38 @@ func ProduceBlockAdvanced(
 		activeGroupCP:        nil,
 	}
 
+	// A fresh vm.EVM is constructed for every transaction below, which upstream
+	// geth's own block processor does not do: its Process() (state_processor.go)
+	// builds one EVM before the transaction loop and reuses it for the whole
+	// block, exactly matching NewEVM's own doc comment ("meant to be used
+	// throughout the entire state transition of a block, with the transaction
+	// context switched as needed by calling evm.SetTxContext"). That switch
+	// already happens on every call regardless of reuse: ApplyMessage
+	// (state_transition.go) calls evm.SetTxContext(NewEVMTxContext(msg))
+	// unconditionally, so reusing the EVM changes nothing about per-tx context.
+	// Reconstructing repeats identical work every tx - activePrecompiledContracts,
+	// a fresh crypto.NewKeccakState(), a jumpDests map immediately discarded by
+	// SetJumpDestCache - for no benefit, since blockContext and chainRules are
+	// both functions of header/chainConfig, neither of which changes mid-block.
+	//
+	// The one hazard: rollbackToGroupCheckpoint *replaces* buildState.statedb
+	// (the only reassignment of that field in this file - see line ~154), which
+	// would leave a hoisted EVM holding a stale StateDB pointer. That path is
+	// reachable only through saveGroupCheckpoint, which is gated on
+	// sequencingHooks.SupportsGroupRollback(); NoopSequencingHooks (the digest/
+	// follower path) reports false, so the rollback structurally cannot fire
+	// there. Reuse is therefore enabled exactly when the hazard is absent, and
+	// the sequencer path (SupportsGroupRollback()==true) keeps today's
+	// construct-per-tx behaviour completely unchanged.
+	reuseEVM := !sequencingHooks.SupportsGroupRollback()
+	var sharedEvm *vm.EVM
+	if reuseEVM {
+		sharedEvm = vm.NewEVM(core.NewEVMBlockContext(header, chainContext, &header.Coinbase), buildState.statedb, chainConfig, vm.Config{ExposeMultiGas: exposeMultiGas})
+		if jdc := jumpDestCache(); jdc != nil {
+			sharedEvm.SetJumpDestCache(jdc)
+		}
+	}
+
 	for {
 		// repeatedly process the next tx, doing redeems created along the way in FIFO order
 
@@ -517,15 +549,25 @@ func ProduceBlockAdvanced(
 			}
 
 			gasPool := gethGas
-			blockContext := core.NewEVMBlockContext(header, chainContext, &header.Coinbase)
-			evm := vm.NewEVM(blockContext, buildState.statedb, chainConfig, vm.Config{ExposeMultiGas: exposeMultiGas})
-			// A new EVM per tx means a new empty JUMPDEST cache per tx, so every
-			// contract a tx touches is re-analysed from scratch. Reuse the
-			// process-wide cache when one is installed; see jumpdest_cache.go.
-			// nil (the default, and always the case under replay) leaves geth's
-			// stock per-EVM map untouched.
-			if jdc := jumpDestCache(); jdc != nil {
-				evm.SetJumpDestCache(jdc)
+			// See reuseEVM above: sharedEvm when the group-rollback hazard is
+			// structurally absent, otherwise construct fresh exactly as before.
+			// evm.TxContext (Origin, GasPrice, ...) needs no manual reset when
+			// reusing - ApplyMessage calls evm.SetTxContext(NewEVMTxContext(msg))
+			// unconditionally on every transaction, reused EVM or not.
+			var evm *vm.EVM
+			if reuseEVM {
+				evm = sharedEvm
+			} else {
+				blockContext := core.NewEVMBlockContext(header, chainContext, &header.Coinbase)
+				evm = vm.NewEVM(blockContext, buildState.statedb, chainConfig, vm.Config{ExposeMultiGas: exposeMultiGas})
+				// A new EVM per tx means a new empty JUMPDEST cache per tx, so every
+				// contract a tx touches is re-analysed from scratch. Reuse the
+				// process-wide cache when one is installed; see jumpdest_cache.go.
+				// nil (the default, and always the case under replay) leaves geth's
+				// stock per-EVM map untouched.
+				if jdc := jumpDestCache(); jdc != nil {
+					evm.SetJumpDestCache(jdc)
+				}
 			}
 			receipt, result, err := core.ApplyTransactionWithResultFilter(
 				evm,
