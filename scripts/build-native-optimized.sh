@@ -287,7 +287,53 @@ ensure_wabt() {
 }
 
 # ----------------------------------------------------------------------------
-# 3. Recommend a --execution.stylus-target.amd64 value for this CPU.
+# 3. Stale brotli marker guard.
+#
+# `make build` tracks the compiled C brotli libraries with empty marker files
+# (.make/cbrotli-lib, .make/cbrotli-wasm). The Makefile recipe only rebuilds
+# brotli when the *marker* is missing - it never re-checks that the .a files
+# the marker stands for are still on disk. A `make clean`, a wiped/partial
+# target/ dir, or an interrupted earlier build can leave the marker behind
+# with no libraries, and then the stylus/jit cargo builds fail to link with:
+#   error: could not find native static library `brotlienc-static`
+# Drop any marker whose libraries are actually missing so make rebuilds them.
+# ----------------------------------------------------------------------------
+drop_stale_brotli_markers() {
+	local lib_files=(
+		target/include/brotli/encode.h
+		target/include/brotli/decode.h
+		target/lib/libbrotlicommon-static.a
+		target/lib/libbrotlienc-static.a
+		target/lib/libbrotlidec-static.a
+	)
+	local wasm_files=(
+		target/lib-wasm/libbrotlicommon-static.a
+		target/lib-wasm/libbrotlienc-static.a
+		target/lib-wasm/libbrotlidec-static.a
+	)
+	local f
+	if [ -f .make/cbrotli-lib ]; then
+		for f in "${lib_files[@]}"; do
+			if [ ! -f "$f" ]; then
+				warn "stale .make/cbrotli-lib (missing $f) - dropping it so make rebuilds brotli"
+				rm -f .make/cbrotli-lib
+				break
+			fi
+		done
+	fi
+	if [ -f .make/cbrotli-wasm ]; then
+		for f in "${wasm_files[@]}"; do
+			if [ ! -f "$f" ]; then
+				warn "stale .make/cbrotli-wasm (missing $f) - dropping it so make rebuilds brotli-wasm"
+				rm -f .make/cbrotli-wasm
+				break
+			fi
+		done
+	fi
+}
+
+# ----------------------------------------------------------------------------
+# 4. Recommend a --execution.stylus-target.amd64 value for this CPU.
 #
 # Runtime configuration, not a build flag - printed as a suggestion for this
 # host's sample_start.sh, not applied to anything. The Stylus JIT (wasmer/
@@ -343,6 +389,8 @@ if [ ! -f go-ethereum/go.mod ] && [ ! -f contracts/package.json ]; then
 	log "submodules look uninitialized; running git submodule update --init --recursive"
 	git submodule update --init --recursive --depth 1
 fi
+
+drop_stale_brotli_markers
 
 GOAMD64_LEVEL="$(detect_goamd64)"
 log "CPU microarchitecture level detected: GOAMD64=${GOAMD64_LEVEL}"
